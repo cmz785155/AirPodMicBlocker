@@ -1,0 +1,15 @@
+# 构建产物
+build/
+dist/
+
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.xcodeproj
+*.xcworkspace
+
+# 打包给别人的 zip
+*.zip
