@@ -24,7 +24,7 @@ macOS 上一旦有程序打开蓝牙耳机的麦克风，蓝牙链路就会从 A
 ## 安装
 
 ```bash
-git clone https://github.com/<你的用户名>/AirPodMicBlocker.git
+git clone https://github.com/YOUR_USERNAME/AirPodMicBlocker.git
 cd AirPodMicBlocker
 ./build.sh
 open ~/Applications/AirPodMicBlocker.app
@@ -96,6 +96,8 @@ AirPodMicBlocker --disable      # 关闭看护
 所以 Apple 已经把「禁用某个设备的麦克风」这个能力从公开 API 里拿掉了。当前实现改用两条确实有效的路径：看护默认输入设备 + 聚合设备。相关说明写在 `Sources/HAL.swift` 里，免得后人重蹈覆辙。
 
 ## 已知限制
+
+**聚合设备只在蓝牙耳机在线时可用。** 聚合设备的时钟绑在耳机的 `:output` 上，耳机断开后它会退化成 `1 入 / 0 出 · 0 Hz` 的空壳 —— 看起来还在设备列表里，录音却完全打不开。工具会检测 `sampleRate == 0` 并自动删除它、把默认输入还原成笔记本麦克风，同时从聚合模式退回直连模式。
 
 **系统音量键在聚合设备模式下失效。** 原因不是实现问题：macOS 的音量键只找默认输出设备的 **master 音量**通道，而 AirPods 的 `:output` 设备本身就没有 master 音量（音量存在声道 element 1/2 上），聚合设备自然也没有。换成 `stacked`（堆叠）模式会更糟 —— 输入通道会直接变成 0。
 

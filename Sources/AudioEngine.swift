@@ -141,6 +141,9 @@ final class AudioEngine {
 
     func setUseAggregate(_ v: Bool) {
         lock.withLock { settings.useAggregate = v }
+        // 关闭聚合设备时必须同时回到直连模式：聚合设备的时钟绑在蓝牙输出上，
+        // 耳机不在时会退化成 0 Hz 的空壳，占着默认输入的位置导致麦克风用不了。
+        if !v { lock.withLock { settings.outputMode = .direct } }
         persist()
         if v {
             if let err = ensureAggregate() { note("聚合设备：\(err)") }
@@ -162,12 +165,23 @@ final class AudioEngine {
         log(msg)
     }
 
+    /// 聚合设备是否健康可用。
+    ///
+    /// 关键判断是**采样率必须大于 0**。蓝牙耳机断开时，聚合设备的时钟设备
+    /// （我们绑的是 AirPods 的 `:output`）会失效，它会退化成 `1 入 / 0 出 · 0 Hz`
+    /// 的空壳 —— 看起来还在设备列表里，但录音完全打不开，而且它还占着
+    /// 「默认输入」的位置，会让用户以为麦克风坏了。
+    static func isAggregateUsable(_ d: AudioDeviceInfo) -> Bool {
+        d.inputChannels > 0 && d.outputChannels > 0 && d.sampleRate > 0
+    }
+
     /// 建立（或修复）聚合设备，并把默认输出/系统输出/默认输入都指向它。
     /// 返回错误描述；成功返回 nil。
     @discardableResult
     func ensureAggregate() -> String? {
         guard let playback = playbackDevice() else {
-            return "找不到蓝牙耳机的输出设备（:output）"
+            // 耳机不在 → 千万别用聚合设备，退回直连
+            return "未连接蓝牙耳机，聚合设备不可用（已保持直连模式）"
         }
         guard let mic = preferredNonBluetoothInput(excluding: "") else {
             return "找不到可用的非蓝牙麦克风"
@@ -177,10 +191,12 @@ final class AudioEngine {
         if let agg = findAggregateDevice(uid: Self.aggregateUID) {
             let sameOut = lock.withLock { settings.aggregateOutUID } == playback.uid
             let sameIn  = lock.withLock { settings.aggregateInUID } == mic.uid
-            if sameOut && sameIn && agg.outputChannels > 0 && agg.inputChannels > 0 {
+            if sameOut && sameIn && Self.isAggregateUsable(agg) {
                 pointDefaults(to: agg)
                 return nil
             }
+            // 不健康或子设备变了 → 先把默认设备从它身上挪开，再删
+            restoreSafeDefaults()
             _ = destroyAggregateDevice(agg.id)
             Thread.sleep(forTimeInterval: 0.4)
         }
@@ -194,16 +210,20 @@ final class AudioEngine {
             return "\(error.localizedDescription)"
         }
 
-        // 设备刚创建，等 coreaudiod 把它列出来
+        // 设备刚创建，等 coreaudiod 把它列出来，并确认它是健康的
         var agg: AudioDeviceInfo?
         for _ in 0..<10 {
             Thread.sleep(forTimeInterval: 0.2)
-            if let a = findAggregateDevice(uid: Self.aggregateUID), a.inputChannels > 0 {
+            if let a = findAggregateDevice(uid: Self.aggregateUID), Self.isAggregateUsable(a) {
                 agg = a
                 break
             }
         }
-        guard let agg else { return "聚合设备已创建但没有出现在设备列表里" }
+        guard let agg else {
+            restoreSafeDefaults()
+            if findAggregateDevice(uid: Self.aggregateUID) != nil { _ = destroyAggregateDevice(findAggregateDevice(uid: Self.aggregateUID)!.id) }
+            return "聚合设备创建失败或不可用，已保持直连模式"
+        }
 
         lock.withLock {
             settings.aggregateOutUID = playback.uid
@@ -224,14 +244,28 @@ final class AudioEngine {
             halSetDefaultDevice(agg.id, kAudioHardwarePropertyDefaultSystemOutputDevice)
             halSetDefaultDevice(agg.id, kAudioHardwarePropertyDefaultInputDevice)
         case .direct:
+            // 直连模式下默认输入直接用笔记本麦克风，**不要**用聚合设备 ——
+            // 聚合设备的时钟绑在蓝牙输出上，耳机一断它就 0 Hz 失效，
+            // 会让「不用耳机、只插内置扬声器」的场景麦克风完全用不了。
             if let bt = playbackDevice() {
                 halSetDefaultDevice(bt.id, kAudioHardwarePropertyDefaultOutputDevice)
                 halSetDefaultDevice(bt.id, kAudioHardwarePropertyDefaultSystemOutputDevice)
-            } else {
-                halSetDefaultDevice(agg.id, kAudioHardwarePropertyDefaultOutputDevice)
-                halSetDefaultDevice(agg.id, kAudioHardwarePropertyDefaultSystemOutputDevice)
             }
-            halSetDefaultDevice(agg.id, kAudioHardwarePropertyDefaultInputDevice)
+            if let mic = preferredNonBluetoothInput(excluding: "") {
+                halSetDefaultDevice(mic.id, kAudioHardwarePropertyDefaultInputDevice)
+            }
+        }
+    }
+
+    /// 把默认设备挪到「肯定能用」的组合，绝不指向聚合设备。
+    /// 输出 → 蓝牙耳机（若有）否则不动；输入 → 笔记本麦克风。
+    private func restoreSafeDefaults() {
+        if let bt = playbackDevice() {
+            halSetDefaultDevice(bt.id, kAudioHardwarePropertyDefaultOutputDevice)
+            halSetDefaultDevice(bt.id, kAudioHardwarePropertyDefaultSystemOutputDevice)
+        }
+        if let mic = preferredNonBluetoothInput(excluding: "") {
+            halSetDefaultDevice(mic.id, kAudioHardwarePropertyDefaultInputDevice)
         }
     }
 
@@ -298,6 +332,22 @@ final class AudioEngine {
     func enforce() -> Report {
         var report = Report()
         guard isEnabled else { return report }
+
+        // 蓝牙耳机不在时，聚合设备的时钟会失效、退化成 0 Hz 空壳，
+        // 必须先把它从默认设备的位置上撤下来，否则麦克风会完全用不了。
+        if let agg = findAggregateDevice(uid: Self.aggregateUID), !Self.isAggregateUsable(agg) {
+            lock.withLock {
+                if settings.outputMode == .aggregate {
+                    settings.outputMode = .direct
+                    lastEvent = "蓝牙耳机已断开，聚合设备失效，自动切回直连"
+                    lastEventAt = Date()
+                }
+            }
+            persist()
+            restoreSafeDefaults()
+            _ = destroyAggregateDevice(agg.id)
+            log("⚠︎ 聚合设备已失效（蓝牙耳机断开），已删除并还原默认设备")
+        }
 
         // 聚合设备是主力手段：设备插拔 / 子设备变化时自动重建
         if lock.withLock({ settings.useAggregate }) {
@@ -452,7 +502,16 @@ final class AudioEngine {
         lines.append("耳机链路：\(hfp.detail)")
         lines.append("看护开关：\(isEnabled ? "已开启" : "已关闭")（累计拉回 \(switchCount) 次）")
         lines.append("输出模式：\(outputMode.label) — \(outputMode.note)")
-        lines.append("聚合设备：\(isAggregateActive ? "已启用（播放→蓝牙耳机，录音→笔记本麦克风）" : "未启用")")
+
+        // 聚合设备健康状况 —— 不健康时明确告诉用户麦克风为什么用不了
+        if let agg = findAggregateDevice(uid: Self.aggregateUID) {
+            let ok = Self.isAggregateUsable(agg)
+            lines.append(ok
+                ? "聚合设备：可用（\(agg.inputChannels) 入 / \(agg.outputChannels) 出 · \(Int(agg.sampleRate)) Hz）"
+                : "聚合设备：⚠️ 不可用（\(agg.inputChannels) 入 / \(agg.outputChannels) 出 · \(Int(agg.sampleRate)) Hz）—— 蓝牙耳机断开导致失效")
+        } else {
+            lines.append("聚合设备：不存在")
+        }
         lines.append("耳机麦克风：\(bluetoothMicInUse ? "⚠️ 正在被使用（HFP 已激活，音质变差）" : "未被使用")")
         lines.append("")
 
