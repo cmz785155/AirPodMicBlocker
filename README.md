@@ -51,7 +51,7 @@ macOS 上一旦有程序打开蓝牙耳机的麦克风，蓝牙链路就会从 A
 ## 安装
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/AirPodMicBlocker.git
+git clone https://github.com/cmz785155/AirPodMicBlocker.git
 cd AirPodMicBlocker
 ./build.sh
 open ~/Applications/AirPodMicBlocker.app
