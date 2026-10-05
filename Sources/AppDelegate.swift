@@ -83,109 +83,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let out = all.first { $0.id == halDefaultDeviceID(kAudioHardwarePropertyDefaultOutputDevice) }
         let inp = all.first { $0.id == halDefaultDeviceID(kAudioHardwarePropertyDefaultInputDevice) }
         let hfp = engine.hfpState()
-        let enabled = engine.isEnabled
 
-        let title = NSMenuItem(title: "AirPod 音质保护", action: nil, keyEquivalent: "")
-        title.isEnabled = false
-        menu.addItem(title)
-
-        // 链路状态
-        addInfo(to: menu,
-                text: hfp.isHFP ? "🔴 耳机处于 HFP（音质变差）" : "🟢 耳机处于 A2DP（高音质）",
-                bold: true,
-                color: hfp.isHFP ? .systemRed : .systemGreen)
-        if let out, out.isBluetooth { addInfo(to: menu, text: "　\(out.name) · \(hfp.detail)") }
-
-        if let inp {
-            let warn = inp.isBluetooth
-            addInfo(to: menu, text: warn ? "⚠︎ 输入用了耳机麦克风：\(inp.name)" : "输入：\(inp.name)",
-                    color: warn ? .systemRed : nil)
-        }
-        if engine.bluetoothMicInUse {
-            addInfo(to: menu, text: "⚠︎ 耳机麦克风正在被使用（音质已降级）",
-                    bold: true, color: .systemRed)
-        }
-        if enabled, let event = engine.lastEventDescription {
-            addInfo(to: menu, text: "上次拉回：\(event)", color: .secondaryLabelColor)
-        }
-        menu.addItem(.separator())
-
-        // 谁在录音
-        let rec = processesRecording()
-        if rec.isEmpty {
-            addInfo(to: menu, text: "没有程序正在录音")
+        // MARK: ① 一行状态，颜色即语义
+        let status: String
+        let statusColor: NSColor
+        if hfp.isHFP {
+            status = "🔴 HFP · 音质已降级"
+            statusColor = .systemRed
+        } else if out?.isBluetooth == true {
+            status = "🟢 A2DP 高音质"
+            statusColor = .systemGreen
         } else {
-            for p in rec {
-                addInfo(to: menu, text: "🎤 \(p.name)", bold: true, color: .systemOrange)
+            status = "⚪︎ 未使用蓝牙耳机"
+            statusColor = .secondaryLabelColor
+        }
+        addInfo(to: menu, text: status, bold: true, color: statusColor)
+
+        // MARK: ② 异常时才出现的行 —— 一切正常时菜单就是最短的样子
+        let recorders = processesRecording()
+        var warned = false
+
+        if engine.bluetoothMicInUse {
+            addInfo(to: menu, text: "🎤 耳机麦克风正在被使用", color: .systemRed)
+            warned = true
+        }
+        for p in recorders {
+            addInfo(to: menu, text: "🎤 正在录音：\(p.name)", color: .systemOrange)
+            warned = true
+        }
+        if inp?.isBluetooth == true {
+            addInfo(to: menu, text: "⚠︎ 输入误用了耳机麦克风", color: .systemRed)
+            warned = true
+        }
+        if warned { menu.addItem(.separator()) }
+
+        // MARK: ③ 音量（只占一行：图标 = 静音开关，滑条 = 音量，右侧 = 数值）
+        if addVolumeRow(to: menu) { menu.addItem(.separator()) }
+
+        // MARK: ④ 两个折叠区
+        addSubmenu(to: menu, title: "输出模式", detail: engine.outputMode.shortLabel) { sub in
+            for mode in AudioEngine.OutputMode.allCases {
+                let item = NSMenuItem(title: mode.shortLabel, action: #selector(selectOutputMode(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = mode.rawValue
+                item.state = engine.outputMode == mode ? .on : .off
+                sub.addItem(item)
+                addInfo(to: sub, text: "     \(mode.note)", color: .secondaryLabelColor)
             }
         }
-        menu.addItem(.separator())
 
-        // 蓝牙耳机
-        let bs = engine.bluetoothDevices
-        if !bs.isEmpty {
-            let header = NSMenuItem(title: "蓝牙音频设备", action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            menu.addItem(header)
-            for d in bs {
-                let role = d.uid.hasSuffix(":input") ? "麦克风侧" : (d.uid.hasSuffix(":output") ? "输出侧" : "")
-                addInfo(to: menu, text: "  \(d.name)\(role.isEmpty ? "" : " · \(role)")")
-                addInfo(to: menu, text: "    \(d.inputChannels) 入 / \(d.outputChannels) 出 · \(Int(d.sampleRate)) Hz",
-                        color: .secondaryLabelColor)
+        addSubmenu(to: menu, title: "更多设置") { sub in
+            addCheck(to: sub, title: "看护默认输入",
+                     on: engine.isEnabled, action: #selector(toggleGuard))
+            addCheck(to: sub, title: "聚合设备当默认输入",
+                     on: engine.isAggregateActive, action: #selector(toggleAggregate))
+            addCheck(to: sub, title: "开机自动启动",
+                     on: isLoginItemEnabled(), action: #selector(toggleLoginItem))
+            sub.addItem(.separator())
+
+            addSubmenu(to: sub, title: "菜单栏图标", detail: iconDisplayName) { iconSub in
+                for choice in Self.iconChoices {
+                    let item = NSMenuItem(title: choice.name, action: #selector(pickIcon(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = choice.symbol
+                    item.state = choice.symbol == chosenIconSymbol ? .on : .off
+                    iconSub.addItem(item)
+                }
             }
-            menu.addItem(.separator())
+            sub.addItem(.separator())
+
+            let diag = NSMenuItem(title: "复制诊断报告", action: #selector(copyReport), keyEquivalent: "")
+            diag.target = self
+            sub.addItem(diag)
+
+            let sound = NSMenuItem(title: "打开「系统设置 › 声音」", action: #selector(openSoundSettings), keyEquivalent: "")
+            sound.target = self
+            sub.addItem(sound)
+
+            if let event = engine.lastEventDescription {
+                sub.addItem(.separator())
+                addInfo(to: sub, text: "上次拉回：\(event)", color: .secondaryLabelColor)
+            }
         }
 
+        // MARK: ⑤ 收尾
         menu.addItem(.separator())
-
-        addVolumeControl(to: menu)
-
-        let iconHeader = NSMenuItem(title: "菜单栏图标", action: nil, keyEquivalent: "")
-        iconHeader.isEnabled = false
-        menu.addItem(iconHeader)
-        addIconPicker(to: menu)
-
-        menu.addItem(.separator())
-
-        addOutputModePicker(to: menu)
-
-        let aggItem = NSMenuItem(title: "用聚合设备当默认输入",
-                                 action: #selector(toggleAggregate), keyEquivalent: "")
-        aggItem.target = self
-        aggItem.state = engine.isAggregateActive ? .on : .off
-        menu.addItem(aggItem)
-
-        let guardItem = NSMenuItem(title: "看护默认输入（离开蓝牙麦克风）",
-                                  action: #selector(toggleGuard), keyEquivalent: "")
-        guardItem.target = self
-        guardItem.state = enabled ? .on : .off
-        menu.addItem(guardItem)
-
-        let loginItem = NSMenuItem(title: "开机自动启动", action: #selector(toggleLoginItem), keyEquivalent: "")
-        loginItem.target = self
-        loginItem.state = isLoginItemEnabled() ? .on : .off
-        menu.addItem(loginItem)
-
-        menu.addItem(.separator())
-
         let apply = NSMenuItem(title: "立刻应用", action: #selector(manualApply), keyEquivalent: "r")
         apply.target = self
         menu.addItem(apply)
 
-        let diag = NSMenuItem(title: "复制诊断报告", action: #selector(copyReport), keyEquivalent: "")
-        diag.target = self
-        menu.addItem(diag)
-
-        let sound = NSMenuItem(title: "打开「系统设置 › 声音」", action: #selector(openSoundSettings), keyEquivalent: "")
-        sound.target = self
-        menu.addItem(sound)
-
-        menu.addItem(.separator())
         let quit = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
 
         statusItem.menu = menu
+        updateIcon(hfp: hfp.isHFP)
+
         updateIcon(hfp: hfp.isHFP)
     }
 
@@ -197,6 +190,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .font: bold ? NSFont.systemFont(ofSize: baseFont.pointSize, weight: .semibold) : baseFont,
             .foregroundColor: color ?? NSColor.labelColor
         ])
+        menu.addItem(item)
+    }
+
+    /// 带右箭头的子菜单项，detail 用灰色小字追加在标题后面
+    private func addSubmenu(to menu: NSMenu, title: String, detail: String? = nil,
+                            build: (NSMenu) -> Void) {
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        build(sub)
+
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let base = NSFont.menuFont(ofSize: 0)
+        let attrs: [NSAttributedString.Key: Any] = [.font: base, .foregroundColor: NSColor.labelColor]
+
+        if let detail {
+            let full = NSMutableAttributedString(string: title + "  " + detail, attributes: attrs)
+            full.addAttributes(
+                [.font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                 .foregroundColor: NSColor.secondaryLabelColor],
+                range: NSRange(location: title.count + 2, length: detail.utf16.count))
+            item.attributedTitle = full
+        } else {
+            item.attributedTitle = NSAttributedString(string: title, attributes: attrs)
+        }
+
+        item.submenu = sub
+        menu.addItem(item)
+    }
+
+    private func addCheck(to menu: NSMenu, title: String, on: Bool, action: Selector) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.state = on ? .on : .off
         menu.addItem(item)
     }
 
@@ -224,6 +250,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return "airpods"
     }
 
+    /// 当前图标的中文名，用于在子菜单标题上回显
+    private var iconDisplayName: String {
+        Self.iconChoices.first { $0.symbol == chosenIconSymbol }?.name ?? "AirPods"
+    }
+
     private func updateIcon(hfp: Bool) {
         let symbol = chosenIconSymbol
         if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "AirPod 音质保护") {
@@ -232,17 +263,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.toolTip = hfp
                 ? "AirPod 音质保护 — ⚠️ 耳机已降到 HFP，音质变差"
                 : "AirPod 音质保护 — 耳机保持 A2DP 高音质"
-        }
-    }
-
-    private func addIconPicker(to menu: NSMenu) {
-        let current = chosenIconSymbol
-        for choice in Self.iconChoices {
-            let item = NSMenuItem(title: "　\(choice.name)", action: #selector(pickIcon(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = choice.symbol
-            item.state = choice.symbol == current ? .on : .off
-            menu.addItem(item)
         }
     }
 
@@ -267,40 +287,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh(force: true)
     }
 
-    private func addVolumeControl(to menu: NSMenu) {
-        guard engine.playbackDevice() != nil else { return }
+    /// 单行音量控件：🔇/🔊 按钮（点击 = 静音开关）＋ 滑条 ＋ 右侧数值。
+    /// 比原来「滑条 / 音量 50% / 静音」三行省两行，信息和功能都保留。
+    /// 返回是否真的加了这一行（没连耳机时不加）。
+    @discardableResult
+    private func addVolumeRow(to menu: NSMenu) -> Bool {
+        guard engine.playbackDevice() != nil else { return false }
 
         let muted = engine.isHeadsetMuted
-        let slider = NSSlider(value: Double(engine.currentHeadsetVolume),
-                              minValue: 0, maxValue: 1,
+        let vol = Double(engine.currentHeadsetVolume)
+        let width: CGFloat = 236
+        let rowH: CGFloat = 24
+
+        let muteBtn = NSButton(title: muted ? "🔇" : "🔊",
+                               target: self, action: #selector(toggleMute))
+        muteBtn.bezelStyle = .inline
+        muteBtn.isBordered = false
+        muteBtn.font = NSFont.systemFont(ofSize: 12)
+        muteBtn.contentTintColor = muted ? .systemRed : .labelColor
+        muteBtn.frame = NSRect(x: 2, y: 3, width: 20, height: 18)
+
+        let slider = NSSlider(value: vol, minValue: 0, maxValue: 1,
                               target: self, action: #selector(volumeChanged(_:)))
         slider.isContinuous = true
         slider.controlSize = .small
+        slider.frame = NSRect(x: 24, y: 2, width: width - 24 - 48, height: 20)
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 210, height: 26))
-        slider.frame = NSRect(x: 6, y: 3, width: 198, height: 20)
-        container.addSubview(slider)
+        let pct = NSTextField(labelWithString: muted ? "静音" : "\(Int(vol * 100))%")
+        pct.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        pct.textColor = muted ? .systemRed : .secondaryLabelColor
+        pct.alignment = .right
+        pct.frame = NSRect(x: width - 44, y: 4, width: 40, height: 16)
 
-        let sliderItem = NSMenuItem()
-        sliderItem.view = container
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: rowH))
+        [muteBtn, slider, pct].forEach(container.addSubview)
 
-        let title = muted ? "🔇 已静音（点此取消）" : String(format: "🔊 音量 %.0f%%", engine.currentHeadsetVolume * 100)
-        let titleItem = NSMenuItem(title: title, action: #selector(toggleMute), keyEquivalent: "")
-        titleItem.target = self
-        titleItem.isEnabled = false
-        titleItem.attributedTitle = NSAttributedString(string: title, attributes: [
-            .font: NSFont.menuFont(ofSize: 0),
-            .foregroundColor: muted ? NSColor.systemRed : NSColor.labelColor
-        ])
-        // 让整行都可点（取消静音）
-        let muteItem = NSMenuItem(title: muted ? "取消静音" : "静音",
-                                  action: #selector(toggleMute), keyEquivalent: "")
-        muteItem.target = self
-
-        menu.addItem(sliderItem)
-        menu.addItem(titleItem)
-        menu.addItem(muteItem)
-        menu.addItem(.separator())
+        let item = NSMenuItem()
+        item.view = container
+        menu.addItem(item)
+        return true
     }
 
     @objc private func selectOutputMode(_ sender: NSMenuItem) {
@@ -308,27 +333,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               let m = AudioEngine.OutputMode(rawValue: mode) else { return }
         engine.setOutputMode(m)
         refresh(force: true)
-    }
-
-    private func addOutputModePicker(to menu: NSMenu) {
-        let header = NSMenuItem(title: "输出模式", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        for mode in AudioEngine.OutputMode.allCases {
-            let item = NSMenuItem(title: mode.label, action: #selector(selectOutputMode(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = mode.rawValue
-            item.state = engine.outputMode == mode ? .on : .off
-            menu.addItem(item)
-            let noteItem = NSMenuItem(title: "      \(mode.note)", action: nil, keyEquivalent: "")
-            noteItem.isEnabled = false
-            noteItem.attributedTitle = NSAttributedString(string: "      \(mode.note)", attributes: [
-                .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
-                .foregroundColor: NSColor.secondaryLabelColor
-            ])
-            menu.addItem(noteItem)
-        }
-        menu.addItem(.separator())
     }
 
     // MARK: - 动作

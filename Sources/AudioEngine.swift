@@ -39,6 +39,13 @@ final class AudioEngine {
             case .direct:    return "耳机直连（音量键可用）"
             }
         }
+        /// 菜单栏折叠标题用的短名 —— 长名字在菜单里太占地方
+        var shortLabel: String {
+            switch self {
+            case .aggregate: return "聚合设备"
+            case .direct:    return "耳机直连"
+            }
+        }
         var note: String {
             switch self {
             case .aggregate: return "系统音量键失效，用 App 内音量条"
