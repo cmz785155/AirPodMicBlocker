@@ -80,6 +80,32 @@ final class AudioEngine {
 
     var isEnabled: Bool { lock.withLock { settings.enabled } }
 
+    // MARK: - 设备缓存（减少 CoreAudio 枚举频率）
+    private var deviceCache: [AudioDeviceInfo]? = nil
+    private var cacheTimestamp: Date? = nil
+    private let cacheTTL: TimeInterval = 2.0
+
+    /// 带缓存的设备枚举——2 秒内直接返回缓存，减少昂贵的 CoreAudio 调用
+    private func cachedAllDevices() -> [AudioDeviceInfo] {
+        let now = Date()
+        if let cache = deviceCache,
+           let ts = cacheTimestamp,
+           now.timeIntervalSince(ts) < cacheTTL {
+            return cache
+        }
+        deviceCache = allDevices()
+        cacheTimestamp = now
+        return deviceCache!
+    }
+
+    /// 强制刷新缓存（设备插拔等事件后调用）
+    private func flushDeviceCache() {
+        lock.lock()
+        deviceCache = nil
+        cacheTimestamp = nil
+        lock.unlock()
+    }
+
     var lastEventDescription: String? {
         lock.withLock {
             guard let e = lastEvent else { return nil }
@@ -366,8 +392,9 @@ final class AudioEngine {
             }
         }
 
+        let cached = cachedAllDevices()
         let inID = halDefaultDeviceID(kAudioHardwarePropertyDefaultInputDevice)
-        guard inID != 0, let current = halDescribe(inID) else {
+        guard inID != 0, let current = cached.first(where: { $0.id == inID }) ?? halDescribe(inID) else {
             report.noFallback = true
             return report
         }
@@ -379,7 +406,8 @@ final class AudioEngine {
             return report
         }
 
-        guard let fallback = preferredNonBluetoothInput(excluding: current.uid) else {
+        guard let fallback = cached.first(where: { $0.hasMic && !$0.isBluetooth && $0.uid != current.uid }) ??
+            preferredNonBluetoothInput(excluding: current.uid) else {
             report.noFallback = true
             log("⚠︎ 默认输入是「\(current.name)」，但找不到可用的非蓝牙麦克风")
             return report
@@ -411,7 +439,7 @@ final class AudioEngine {
 
     /// 蓝牙音频设备（含 :input / :output 两半）
     var bluetoothDevices: [AudioDeviceInfo] {
-        allDevices().filter { $0.isBluetooth }
+        cachedAllDevices().filter { $0.isBluetooth }
     }
 
     /// AirPods 输出侧（A2DP 立体声播放）
@@ -455,16 +483,47 @@ final class AudioEngine {
     // MARK: 日志
 
     private let logLock = NSLock()
+    private var logBuffer: [String] = []
+    private var logFlushTimer: Timer?
+    private let maxLogBatch = 10
 
     func log(_ message: String) {
-        logLock.lock(); defer { logLock.unlock() }
+        logLock.lock()
+        logBuffer.append(message)
+        // 满 10 条立即刷盘，否则等 5 秒再批量写入
+        if logBuffer.count >= maxLogBatch {
+            flushLog()
+        } else if logFlushTimer == nil {
+            logFlushTimer = Timer(timeInterval: 5.0, repeats: false) { [weak self] _ in
+                self?.flushLog()
+                self?.logFlushTimer = nil
+            }
+            RunLoop.main.add(logFlushTimer!, forMode: .common)
+        }
+        logLock.unlock()
+    }
+
+    func flushLog() {
+        logLock.lock()
+        guard !logBuffer.isEmpty else { logLock.unlock(); return }
+        let entries = logBuffer
+        logBuffer.removeAll()
+        logLock.unlock()
+
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let line = "[\(f.string(from: Date()))] \(message)\n"
-        if let fh = FileHandle(forWritingAtPath: logURL.path) {
-            fh.seekToEndOfFile(); fh.write(Data(line.utf8)); try? fh.close()
-        } else {
-            try? Data(line.utf8).write(to: logURL, options: .atomic)
+        let lines = entries.map { "[\(f.string(from: Date()))] \($0)\n" }
+        let batch = lines.joined()
+        do {
+            if let fh = FileHandle(forWritingAtPath: logURL.path) {
+                fh.seekToEndOfFile()
+                fh.write(Data(batch.utf8))
+                try? fh.close()
+            } else {
+                try Data(batch.utf8).write(to: logURL, options: .atomic)
+            }
+        } catch {
+            // 日志写入失败静默忽略
         }
     }
 
@@ -476,8 +535,8 @@ final class AudioEngine {
             if r.switched { previous = "" }
 
             let hfp = hfpState()
-            let inDev = allDevices().first { $0.id == halDefaultDeviceID(kAudioHardwarePropertyDefaultInputDevice) }
-            let outDev = allDevices().first { $0.id == halDefaultDeviceID(kAudioHardwarePropertyDefaultOutputDevice) }
+            let inDev = cachedAllDevices().first { $0.id == halDefaultDeviceID(kAudioHardwarePropertyDefaultInputDevice) }
+            let outDev = cachedAllDevices().first { $0.id == halDefaultDeviceID(kAudioHardwarePropertyDefaultOutputDevice) }
             let users = recorders.map { "\($0.name)(\($0.bundleID))" }.joined(separator: ",")
 
             let line = String(
@@ -498,7 +557,7 @@ final class AudioEngine {
 
     func snapshotLines() -> [String] {
         var lines: [String] = []
-        let all = allDevices()
+        let all = cachedAllDevices()
         let inDev = all.first { $0.id == halDefaultDeviceID(kAudioHardwarePropertyDefaultInputDevice) }
         let outDev = all.first { $0.id == halDefaultDeviceID(kAudioHardwarePropertyDefaultOutputDevice) }
         let hfp = hfpState()

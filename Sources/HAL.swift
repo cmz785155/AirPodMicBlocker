@@ -418,6 +418,10 @@ func createAggregateDevice(name: String,
 //  CoreAudio 报告的设备格式在切 HFP 时**不会变**，所以看不到降级。
 //  但 bluetoothd 的链路质量日志里有 `HFP handle 0x0000` —— handle 非 0 就说明
 //  蓝牙栈真的开了 HFP（SCO/eSCO），也就是音质的那个分水岭。
+//
+//  优化：不再持续运行 `log stream` 进程（这是功耗的主要来源）。
+//  改为 Timer 定期检查，空闲时 10 秒一次，检测到 HFP 时自动升频到 1 秒。
+//  同时优先使用 CoreAudio 属性（声道数、采样率）做快速判断，减少子进程调用。
 
 final class HFPWatcher {
 
@@ -426,7 +430,6 @@ final class HFPWatcher {
     private let lock = NSLock()
     private var _active = false
     private var _lastSeen: Date?
-    private var proc: Process?
 
     /// 蓝牙栈当前是否处于 HFP（HFP handle 非 0）
     var isHFPActive: Bool { lock.withLock { _active } }
@@ -434,59 +437,89 @@ final class HFPWatcher {
 
     private init() {}
 
+    // MARK: - 智能定时器（不再启动 log stream 进程）
+    // 空闲时 10 秒检查一次，检测到 HFP 降级时自动升频到 1 秒
+    private var checkTimer: Timer?
+    private var isMonitoring = false
+
     func start() {
         lock.lock()
-        if proc != nil { lock.unlock(); return }
+        guard !isMonitoring else { lock.unlock(); return }
+        isMonitoring = true
         lock.unlock()
 
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/log")
-        p.arguments = [
-            "stream", "--style", "compact", "--level", "debug",
-            "--predicate", "subsystem == \"com.apple.bluetooth\""
-        ]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-
-        p.terminationHandler = { [weak self] _ in
-            self?.lock.lock(); self?.proc = nil; self?.lock.unlock()
-        }
-
-        do {
-            try p.run()
-        } catch {
-            return
-        }
-        lock.lock(); proc = p; lock.unlock()
-
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            self?.ingest(text)
-        }
+        scheduleCheck(interval: 10.0)
     }
 
     func stop() {
         lock.lock()
-        let p = proc
-        proc = nil
+        isMonitoring = false
+        checkTimer?.invalidate()
+        checkTimer = nil
         lock.unlock()
-        p?.terminate()
     }
 
-    /// 解析形如 `HFP handle 0x0000` 的行
-    private func ingest(_ text: String) {
-        var sawAny = false
+    private func scheduleCheck(interval: TimeInterval) {
+        checkTimer?.invalidate()
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            self?.doCheck()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        lock.lock()
+        checkTimer = t
+        lock.unlock()
+    }
+
+    /// 单次检查：先通过 CoreAudio 属性判断（零子进程），A2DP 正常时偶尔用 log 命令确认
+    private func doCheck() {
+        lock.lock()
+        guard isMonitoring else { lock.unlock(); return }
+        lock.unlock()
+
+        // 方法 1：通过蓝牙设备属性判断（轻量，无需启动子进程）
+        if let out = bluetoothPlaybackDevice() {
+            if out.outputChannels == 1 || (out.sampleRate > 0 && out.sampleRate < 32000) {
+                lock.lock()
+                _active = true
+                _lastSeen = Date()
+                lock.unlock()
+                scheduleCheck(interval: 1.0)
+                return
+            }
+        }
+
+        // 方法 2：轻量一次性 log 命令确认（不持续监听）
+        checkViaLogOnce()
+    }
+
+    /// 一次性 log 命令检查，不持续监听
+    private func checkViaLogOnce() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        let bluetoothPred = "subsystem == \"com.apple.bluetooth\" AND message contains \"HFP handle\""
+        p.arguments = ["--predicate", bluetoothPred, "--last", "50"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+
+        do { try p.run() } catch { return }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+
+        guard let text = String(data: data, encoding: .utf8) else { return }
+
         var active = false
         for line in text.split(separator: "\n") {
             guard let range = line.range(of: #"HFP handle 0x([0-9A-Fa-f]+)"#,
                                         options: .regularExpression) else { continue }
-            sawAny = true
             let hex = line[range].split(separator: "x").last ?? "0"
-            active = (UInt32(hex, radix: 16) ?? 0) != 0
+            if (UInt32(hex, radix: 16) ?? 0) != 0 {
+                active = true
+                break
+            }
         }
-        guard sawAny else { return }
+
         lock.lock()
         _active = active
         _lastSeen = Date()
@@ -554,7 +587,7 @@ func halHeadsetMuted() -> Bool? {
 
 @discardableResult
 func halSetHeadsetMuted(_ muted: Bool) -> OSStatus {
-    guard let dev = bluetoothPlaybackDevice() else { return kAudioHardwareBadDeviceError }
+    guard let dev = bluetoothPlaybackDevice() else { return kAudioHardwareIllegalOperationError }
     var addr = halAddr(kAudioDevicePropertyMute, Scope.output, kAudioObjectPropertyElementMain)
     guard AudioObjectHasProperty(dev.id, &addr) else { return kAudioHardwareIllegalOperationError }
     let m: UInt32 = muted ? 1 : 0

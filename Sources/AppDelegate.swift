@@ -8,6 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var lastSignature = ""
 
+    // MARK: - 自适应定时器（空闲时长间隔，异常时短间隔）
+    private var currentInterval: TimeInterval = 5.0
+    private var hfpDetected = false
+
     private let engine = AudioEngine.shared
 
     // MARK: - 启动
@@ -21,7 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh(force: true)
         engine.enforce()
 
-        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
+        let t = Timer(timeInterval: currentInterval, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
         timer = t
 
@@ -33,7 +37,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        timer = nil
         HFPWatcher.shared.stop()
+        // 确保日志刷盘
+        engine.flushLog()
     }
 
     private var lastHFPSignature: String?
@@ -50,6 +57,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             engine.log(hfp.isHFP
                 ? "🔴 蓝牙链路切到 HFP（音质变差） · \(hfp.detail) · 录音中: \(recs.isEmpty ? "无" : recs)"
                 : "🟢 蓝牙链路回到 A2DP（高音质） · \(hfp.detail)")
+        }
+
+        // 自适应定时器：检测到 HFP 降级时缩短间隔，恢复正常后拉长
+        if hfp.isHFP && !hfpDetected {
+            hfpDetected = true
+            timer?.invalidate()
+            timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
+            RunLoop.main.add(timer!, forMode: .common)
+        } else if !hfp.isHFP && hfpDetected {
+            hfpDetected = false
+            timer?.invalidate()
+            timer = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in self?.tick() }
+            RunLoop.main.add(timer!, forMode: .common)
         }
 
         refresh(force: report.switched)
